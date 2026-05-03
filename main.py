@@ -763,12 +763,17 @@ Drafting rules:
 CRITICAL: Never invent specific figures (financial amounts, dates, regulatory numbers).
 Always use [INSERT: description] placeholders for client-specific details."""
 
-    user_msg = f"""Draft: {data.doc_type}
+    # If Additional Terms clearly describe a DIFFERENT document, let them override.
+    instruction_override = ""
+    if data.key_terms and len(data.key_terms.strip()) > 60:
+        instruction_override = "\n\nCRITICAL OVERRIDE: If the Additional Instructions below describe a completely different document type than the selected type above (e.g. a Legal Notice when NDA was selected), you MUST draft the document described in the Additional Instructions. The instructions always take precedence over the dropdown selection."
+
+    user_msg = f"""Draft document type selected: {data.doc_type}
 
 Party A: {data.party_a}
 Party B: {data.party_b}
 Jurisdiction: {data.jurisdiction}
-Additional terms/instructions: {data.key_terms if data.key_terms else 'Standard terms — all clauses'}"""
+Additional Instructions (READ CAREFULLY — these may override the document type above): {data.key_terms if data.key_terms else 'Standard terms — all standard clauses for the document type'}{instruction_override}"""
 
     async def stream_draft():
         full_text = ""
@@ -1124,9 +1129,13 @@ async def legal_research_khan(request: Request, data: ResearchRequest):
 {live_context[:6000]}
 
 Base your answer on the above retrieved texts where possible.""" if live_context else \
-f"""No live law texts retrieved for this query.
-Answer from training knowledge. Mark every key legal statement: [VERIFY AGAINST CURRENT SOURCE]
-Provide official source URLs for independent verification."""
+f"""No documents were retrieved from the Jurivon law database for this query.
+Answer from training knowledge. Apply these strict rules:
+1. For any citation you are NOT certain is real and accurate, write: [CITATION UNVERIFIED - cannot be confirmed in reported decisions]
+2. NEVER say a case is missing from your "training data" - instead say "this citation cannot be confirmed in reported decisions"
+3. For fake or unrecognisable citations, state clearly: "This citation does not appear in any reported legal database"
+4. For statute sections: if you are uncertain the section number is correct, state the section exists but flag the number as [VERIFY SECTION NUMBER]
+5. Provide official source URLs as clickable references."""
 
     system = f"""You are Khan — Jurivon's senior legal research AI. Expert in global legal systems.
 
@@ -1134,25 +1143,35 @@ Legal system: {jur_system}
 
 {context_section}
 
-Response format — EXACTLY:
+CRITICAL HALLUCINATION RULES — APPLY WITHOUT EXCEPTION:
+- If a case citation is unrecognisable or cannot be confirmed, respond: "This citation cannot be verified in reported decisions. It does not appear in any reported legal database."
+- NEVER say a case is not in your "training data" — say it cannot be verified in reported decisions.
+- For statute sections: quote the actual text if retrieved. If only summarising from training knowledge, mark: [SUMMARY — VERIFY EXACT TEXT AT OFFICIAL SOURCE]
+- Only provide verification URLs that are real government/official sites. Do not invent URLs.
+
+Response format — EXACTLY this structure:
 
 DIRECT ANSWER:
-[Clear, specific answer in 2-3 sentences]
+[Clear, specific answer in 2-3 sentences. No hedging on well-established points.]
 
 LEGAL BASIS:
-[Specific statutes, articles, case law with accurate citations]
+[Specific statutes and articles with accurate citations. Include section numbers.]
+
+STATUTE TEXT:
+[If available from retrieved sources: quote the EXACT verbatim text of the most relevant provision.
+If not retrieved: write "Verbatim text not available — verify at [official URL]"]
 
 DETAILED ANALYSIS:
-[Comprehensive explanation — min 3 paragraphs]
+[Comprehensive explanation — minimum 3 paragraphs. Apply the law to the question concretely.]
 
 PRACTICAL IMPLICATIONS:
-[What this means for the client in practice]
+[What this means for the client in practice — specific, actionable points]
 
 IMPORTANT CAVEATS:
-[Limitations, recent developments, jurisdictional nuances]
+[Genuine limitations only. No generic disclaimers. If the law is settled, say so.]
 
 VERIFICATION SOURCES:
-[Official URLs where this can be verified]
+[Real official URLs only — e.g. pakistancode.gov.pk, legislation.gov.uk, eur-lex.europa.eu]
 
 ---
 Researched by: Khan | Jurivon Legal Research AI v3
@@ -1191,20 +1210,22 @@ async def citation_verify(request: Request, data: CitationRequest):
     Hallucination protection: verify if a legal citation is real.
     Returns VERIFIED / LIKELY REAL / UNVERIFIABLE / SUSPICIOUS / INCORRECT.
     """
-    system = """You are a legal citation verification specialist.
-Assess whether the provided legal citation is real, accurate, and verifiable.
+    system = """You are a legal citation verification specialist. Your job is hallucination detection.
 
 Return EXACTLY:
 
-VERIFICATION RESULT: [VERIFIED / LIKELY REAL / UNVERIFIABLE / SUSPICIOUS / INCORRECT]
+VERIFICATION RESULT: [VERIFIED / LIKELY REAL / UNVERIFIABLE / CANNOT BE CONFIRMED / DOES NOT EXIST]
 CONFIDENCE: [0-100]%
-ASSESSMENT: [explain your reasoning in 2-3 sentences]
-SOURCE URL: [official URL to verify, or 'Not directly available']
-WARNING: [if citation appears fabricated, explain specifically why]
-RECOMMENDATION: [what the lawyer should do to verify this citation]
+ASSESSMENT: [2-3 sentences. If unverifiable, state: "This citation cannot be confirmed in reported decisions" — NEVER say it is not in your training data]
+SOURCE URL: [real official URL to verify, or state 'Verify at: [relevant official court/statute website]']
+WARNING: [If the citation looks fabricated — wrong format, impossible case number, non-existent section — state this explicitly and clearly]
+RECOMMENDATION: [specific action: e.g. "Search supremecourt.gov.pk" or "Check pakistancode.gov.pk Section X"]
 
-Critical rule: If you cannot confirm a citation from training knowledge,
-return UNVERIFIABLE — never invent verification."""
+STRICT RULES:
+1. If a case number looks fabricated (e.g. SCMR 9999, LHC 99999), say: "This citation cannot be confirmed in reported decisions and the case number format is irregular."
+2. If a statute section does not exist, say: "Section [X] does not appear to exist in [Act]."
+3. NEVER return VERIFIED for something you are not certain about.
+4. NEVER say citations are missing from your training data — say they cannot be confirmed in reported decisions."""
 
     try:
         result = await call_ai([
