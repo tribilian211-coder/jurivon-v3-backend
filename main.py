@@ -49,6 +49,20 @@ from dotenv import load_dotenv
 
 import httpx
 import pdfplumber
+
+# InLegalBERT integration - graceful fallback if not loaded
+try:
+    from legal_bert import (
+        get_bert, enhance_contract_review_prompt,
+        enhance_conflict_check, validate_citation_before_gpt
+    )
+    BERT_AVAILABLE = True
+except ImportError:
+    BERT_AVAILABLE = False
+    def get_bert(): return None
+    def enhance_contract_review_prompt(t): return ""
+    def enhance_conflict_check(t, m): return {"conflicts_detected": [], "entity_summary": ""}
+    def validate_citation_before_gpt(c, j): return {"pre_validated": False, "skip_gpt": False}
 from openai import AsyncOpenAI
 from supabase import create_client, Client
 from tenacity import (retry, stop_after_attempt,
@@ -429,9 +443,25 @@ Rules:
 - LOW RISK = minor connection, flag for monitoring
 - CLEAR = no conflicts found"""
 
+    # InLegalBERT entity extraction to improve conflict detection
+    bert_conflict = ""
+    if BERT_AVAILABLE and matters:
+        try:
+            conflict_data = enhance_conflict_check(
+                data.matter_description, matters)
+            bert_conflict = f"""
+PRE-EXTRACTED ENTITIES FROM NEW MATTER:
+{conflict_data['entity_summary']}
+Organizations found: {', '.join(conflict_data['new_matter_entities'].get('organizations', [])[:8])}
+Auto-detected conflicts: {len(conflict_data['conflicts_detected'])} potential matches
+{chr(10).join([f"  - {c['matter_ref']}: matches on {', '.join(c['matching_entities'])} [{c['severity']}]" for c in conflict_data['conflicts_detected'][:5]])}
+"""
+        except Exception as e:
+            logger.warning(f"BERT conflict enhancement failed: {e}")
+
     user_msg = f"""NEW MATTER:
 {data.matter_description}
-
+{bert_conflict}
 EXISTING MATTERS IN DATABASE ({len(matters)} records):
 {matters_text[:6000]}
 
@@ -557,8 +587,16 @@ async def contract_review(
 
     perspective_note = f"\nReview from the perspective of: {party_perspective}" if party_perspective else ""
 
-    system = f"""You are a senior commercial lawyer reviewing a contract for a law firm client.{perspective_note}
+    # InLegalBERT pre-analysis: extract entities and classify clauses
+    bert_analysis = ""
+    if BERT_AVAILABLE:
+        try:
+            bert_analysis = enhance_contract_review_prompt(text)
+        except Exception as e:
+            logger.warning(f"BERT pre-analysis failed: {e}")
 
+    system = f"""You are a senior commercial lawyer reviewing a contract for a law firm client.{perspective_note}
+{f"Use this pre-extracted analysis to guide your review:{chr(10)}{bert_analysis}{chr(10)}" if bert_analysis else ""}
 Identify ALL issues. Use EXACTLY this format for each issue:
 
 ---
@@ -1210,6 +1248,22 @@ async def citation_verify(request: Request, data: CitationRequest):
     Hallucination protection: verify if a legal citation is real.
     Returns VERIFIED / LIKELY REAL / UNVERIFIABLE / SUSPICIOUS / INCORRECT.
     """
+    # InLegalBERT citation format pre-validation
+    # If citation format is clearly invalid, skip GPT-4o entirely
+    pre_check = validate_citation_before_gpt(
+        data.citation, data.jurisdiction)
+    if pre_check.get("skip_gpt"):
+        return ok({
+            "result": f"VERIFICATION RESULT: CANNOT BE CONFIRMED\nCONFIDENCE: 5%\n"
+                     f"ASSESSMENT: {pre_check['message']}\n"
+                     f"WARNING: {'; '.join(pre_check.get('issues', []))}\n"
+                     f"RECOMMENDATION: {pre_check.get('suggestion', 'Verify at official court/statute database')}",
+            "citation": data.citation,
+            "status": "CANNOT BE CONFIRMED",
+            "jurisdiction": data.jurisdiction,
+            "source": "InLegalBERT format validation"
+        })
+
     system = """You are a legal citation verification specialist. Your job is hallucination detection.
 
 Return EXACTLY:
