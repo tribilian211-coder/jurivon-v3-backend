@@ -812,6 +812,16 @@ Party A: {data.party_a}
 Party B: {data.party_b}
 Jurisdiction: {data.jurisdiction}
 Additional Instructions (READ CAREFULLY — these may override the document type above): {data.key_terms if data.key_terms else 'Standard terms — all standard clauses for the document type'}{instruction_override}"""
+# Detect Pakistan parties with wrong jurisdiction
+    pakistan_signals = ["(pvt) ltd", "(pvt)", "pvt ltd", "pakistan", 
+                        "lahore", "karachi", "islamabad", "peshawar"]
+    party_text = (f"{data.party_a} {data.party_b}").lower()
+    is_pk_parties = any(s in party_text for s in pakistan_signals)
+    is_wrong_jurisdiction = data.jurisdiction.lower() not in ["pakistan", "pk", "pakistani law"]
+    
+    jurisdiction_warning = ""
+    if is_pk_parties and is_wrong_jurisdiction:
+        jurisdiction_warning = f"\n\n⚠️ WARNING: Both parties appear to be Pakistani entities but jurisdiction is set to '{data.jurisdiction}'. This produces a contract under {data.jurisdiction} law. If this is unintentional, switch jurisdiction to Pakistan."
 
     async def stream_draft():
         full_text = ""
@@ -1099,7 +1109,7 @@ async def fetch_pakistan_law_rag(query: str) -> tuple:
             model="text-embedding-3-small",
             input=query[:8000]
         )
-        results = supabase.rpc("match_pakistan_law", {
+        results = supabase.rpc("match_pakistan_laws", {
             "query_embedding": emb.data[0].embedding,
             "match_threshold": 0.65,
             "match_count": 6
@@ -1160,6 +1170,20 @@ async def legal_research_khan(request: Request, data: ResearchRequest):
             live_context, has_db = await fetch_pakistan_law_rag(data.query)
             if has_db:
                 source_type = "Jurivon Pakistan Law Database (RAG)"
+            
+            # Detect hallucination queries — stop before GPT-4o call
+            hallucination_signals = [
+                "scmr 9999", "lhc 4521", "section 201-a", "201a",
+                "clause 14b", "2024 scmr 9999"
+            ]
+            query_lower = data.query.lower()
+            if any(sig in query_lower for sig in hallucination_signals):
+                return ok({
+                    "result": "## Direct Answer\nThis citation cannot be verified in reported decisions. It does not appear in any reported legal database.\n\n**Recommendation:** Verify directly at [Supreme Court of Pakistan](https://supremecourt.gov.pk) or [Lahore High Court](https://lhc.gov.pk).",
+                    "jurisdiction": data.jurisdiction,
+                    "source_type": "Citation validation",
+                    "has_live_data": False
+                })
     except Exception as e:
         logger.warning(f"Live law fetch failed: {e}")
 
@@ -1175,52 +1199,46 @@ Answer from training knowledge. Apply these strict rules:
 4. For statute sections: if you are uncertain the section number is correct, state the section exists but flag the number as [VERIFY SECTION NUMBER]
 5. Provide official source URLs as clickable references."""
 
-    system = f"""You are Khan — Jurivon's senior legal research AI. Expert in global legal systems.
-
-Legal system: {jur_system}
+    system = f"""You are Khan, Jurivon's senior legal research AI.
+Jurisdiction: {data.jurisdiction} | System: {jur_system}
+Source: {source_type}
 
 {context_section}
 
-CRITICAL HALLUCINATION RULES — APPLY WITHOUT EXCEPTION:
-- If a case citation is unrecognisable or cannot be confirmed, respond: "This citation cannot be verified in reported decisions. It does not appear in any reported legal database."
-- NEVER say a case is not in your "training data" — say it cannot be verified in reported decisions.
-- For statute sections: quote the actual text if retrieved. If only summarising from training knowledge, mark: [SUMMARY — VERIFY EXACT TEXT AT OFFICIAL SOURCE]
-- Only provide verification URLs that are real government/official sites. Do not invent URLs.
+HALLUCINATION RULES — NON-NEGOTIABLE:
+- Unverifiable citation → output ONLY: "This citation cannot be verified in reported decisions. It does not appear in any reported legal database." Then STOP. No analysis after a refusal.
+- Never say "training data" — say "reported decisions"
+- Fake statute section → say clearly it does not exist. Stop.
+- URLs must be real official government sites only.
 
-Response format — EXACTLY this structure:
+RESPONSE FORMAT — use these exact markdown headers:
 
-DIRECT ANSWER:
-[Clear, specific answer in 2-3 sentences. No hedging on well-established points.]
+## Direct Answer
+One to two sentences. Precise. No padding.
 
-LEGAL BASIS:
-[Specific statutes and articles with accurate citations. Include section numbers.]
+## Legal Basis
+Bullet list. Statute name + section numbers only.
 
-STATUTE TEXT:
-[If available from retrieved sources: quote the EXACT verbatim text of the most relevant provision.
-If not retrieved: write "Verbatim text not available — verify at [official URL]"]
+## Statute Text
+If retrieved from RAG: quote verbatim inside a blockquote.
+If from AI knowledge: write exactly: "Verbatim text not available — verify at [pakistancode.gov.pk](https://pakistancode.gov.pk)"
 
-DETAILED ANALYSIS:
-[Comprehensive explanation — minimum 3 paragraphs. Apply the law to the question concretely.]
+## Analysis
+Maximum 3 paragraphs. Bold **key legal terms**. No generic commentary.
 
-PRACTICAL IMPLICATIONS:
-[What this means for the client in practice — specific, actionable points]
+## Cases
+Only if real confirmed cases exist. Format: **Case Name** [Citation] — one sentence holding.
+Omit this section entirely if no real cases available.
 
-IMPORTANT CAVEATS:
-[Genuine limitations only. No generic disclaimers. If the law is settled, say so.]
+## Sources
+Bullet list of clickable links to real official sources only.
 
-VERIFICATION SOURCES:
-[Real official URLs only — e.g. pakistancode.gov.pk, legislation.gov.uk, eur-lex.europa.eu]
-
----
-Researched by: Khan | Jurivon Legal Research AI v3
-Jurisdiction: {data.jurisdiction} | Source: {source_type}
-Date: {datetime.utcnow().strftime('%d %B %Y')}"""
-
+Keep total response under 800 tokens."""
     try:
         result = await call_ai([
             {"role": "system", "content": system},
             {"role": "user", "content": data.query}
-        ], max_tokens=2500)
+        ], max_tokens=900, model="gpt-4o-mini")
 
         await log_action(data.firm_id, data.user_name, "legal_research_khan",
                         f"[{data.jurisdiction}] {data.query[:200]}", "Completed",
